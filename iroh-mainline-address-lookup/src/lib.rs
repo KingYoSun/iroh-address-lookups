@@ -510,25 +510,27 @@ mod tests {
                 assert!(poll_once(items.next()).await.is_none());
             }
         }
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let items = resolver
-                    .resolve(secret.public())
-                    .unwrap()
-                    .collect::<Vec<_>>()
-                    .await;
-                if items
-                    .iter()
-                    .flatten()
-                    .any(|item| item.relay_urls().any(|url| *url == relay_url))
-                {
-                    break;
+        for lookup in [&resolver, &publisher] {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let items = lookup
+                        .resolve(secret.public())
+                        .unwrap()
+                        .collect::<Vec<_>>()
+                        .await;
+                    if items
+                        .iter()
+                        .flatten()
+                        .any(|item| item.relay_urls().any(|url| *url == relay_url))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-        .await
-        .expect("the address published through the given node was not found");
+            })
+            .await
+            .expect("the address published through the given node was not found");
+        }
         Ok(())
     }
 
