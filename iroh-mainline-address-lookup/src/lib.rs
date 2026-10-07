@@ -384,6 +384,7 @@ mod tests {
 
     use iroh_base::{RelayUrl, TransportAddr};
     use n0_error::{Result, StdResultExt};
+    use n0_future::future::poll_once;
     use n0_mainline::{Id, Testnet};
     use n0_tracing_test::traced_test;
     use url::Url;
@@ -502,6 +503,13 @@ mod tests {
             .dht(reader)
             .no_publish()
             .build()?;
+        // Resolves dropped before they answer leave the lookups working.
+        for lookup in [&publisher, &resolver] {
+            for _ in 0..8 {
+                let mut items = lookup.resolve(SecretKey::generate().public()).unwrap();
+                assert!(poll_once(items.next()).await.is_none());
+            }
+        }
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let items = resolver
