@@ -150,6 +150,7 @@ impl Inner {
 /// By default, publishing to the DHT is enabled, and relay publishing is disabled.
 #[derive(Debug)]
 pub struct Builder {
+    dht: Option<Dht>,
     dht_builder: Option<DhtBuilder>,
     secret_key: Option<SecretKey>,
     ttl: Option<u32>,
@@ -161,6 +162,7 @@ pub struct Builder {
 impl Default for Builder {
     fn default() -> Self {
         Self {
+            dht: None,
             dht_builder: None,
             secret_key: None,
             ttl: None,
@@ -175,6 +177,17 @@ impl Builder {
     /// Explicitly sets the DHT builder to use.
     pub fn dht_builder(mut self, builder: DhtBuilder) -> Self {
         self.dht_builder = Some(builder);
+        self
+    }
+
+    /// Uses an existing DHT node instead of building one.
+    ///
+    /// The node, and its socket, can then also serve other protocols. It keeps
+    /// running until its last handle is dropped, so dropping the address
+    /// lookup alone does not stop it. Takes precedence over
+    /// [`Self::dht_builder`].
+    pub fn dht(mut self, dht: Dht) -> Self {
+        self.dht = Some(dht);
         self
     }
 
@@ -224,10 +237,14 @@ impl Builder {
     /// Must be called from within a Tokio runtime context: the DHT's UDP socket
     /// is registered with the Tokio reactor during construction.
     pub fn build(self) -> Result<DhtAddressLookup, AddressLookupBuilderError> {
-        let dht_builder = self.dht_builder.unwrap_or_default();
-        let dht = dht_builder
-            .build()
-            .map_err(|e| AddressLookupBuilderError::from_err("pkarr-dht", e))?;
+        let dht = match self.dht {
+            Some(dht) => dht,
+            None => self
+                .dht_builder
+                .unwrap_or_default()
+                .build()
+                .map_err(|e| AddressLookupBuilderError::from_err("pkarr-dht", e))?,
+        };
         let ttl = self.ttl.unwrap_or(DEFAULT_PKARR_TTL);
         let secret_key = self.secret_key.filter(|_| self.enable_publish);
 
@@ -261,18 +278,20 @@ impl DhtAddressLookup {
     ///
     /// Publishes the current endpoint information to the DHT and refreshes it periodically.
     ///
+    /// The task holds the DHT node only, not the address lookup, so that dropping
+    /// the address lookup stops it.
+    ///
     /// We publish without CAS. We assume a single logical writer per endpoint key.
-    async fn publish_loop(self, signed_packet: SignedPacket) {
-        let this = self;
+    async fn publish_loop(dht: Dht, republish_delay: Duration, signed_packet: SignedPacket) {
         let public_key = signed_packet.public_key();
         let z32 = public_key.to_z32();
         let item = signed_packet_to_mutable_item(&signed_packet);
-        let Ok(info) = this.0.dht.info().await else {
+        let Ok(info) = dht.info().await else {
             tracing::error!("failed to read dht info; stopping publish task");
             return;
         };
         if info.routing_table_size() == 0 {
-            let Ok(bootstrapped) = this.0.dht.bootstrapped().await else {
+            let Ok(bootstrapped) = dht.bootstrapped().await else {
                 tracing::error!("dht bootstrap probe failed; stopping publish task");
                 return;
             };
@@ -292,7 +311,7 @@ impl DhtAddressLookup {
         }
 
         loop {
-            let res = this.0.dht.put_mutable(item.clone(), None).await;
+            let res = dht.put_mutable(item.clone(), None).await;
             match res {
                 Ok(_) => {
                     tracing::debug!("pkarr publish success. published under {z32}");
@@ -307,7 +326,7 @@ impl DhtAddressLookup {
                     tracing::warn!("pkarr publish error: {}", e);
                 }
             }
-            time::sleep(this.0.republish_delay).await;
+            time::sleep(republish_delay).await;
         }
     }
 }
@@ -333,8 +352,11 @@ impl AddressLookup for DhtAddressLookup {
             tracing::warn!("failed to create signed packet");
             return;
         };
-        let this = self.clone();
-        let curr = task::spawn(this.publish_loop(signed_packet));
+        let curr = task::spawn(Self::publish_loop(
+            self.0.dht.clone(),
+            self.0.republish_delay,
+            signed_packet,
+        ));
         let mut task = self.0.task.lock().expect("poisoned");
         *task = Some(AbortOnDropHandle::new(curr));
     }
@@ -362,7 +384,8 @@ mod tests {
 
     use iroh_base::{RelayUrl, TransportAddr};
     use n0_error::{Result, StdResultExt};
-    use n0_mainline::Testnet;
+    use n0_future::future::poll_once;
+    use n0_mainline::{Id, Testnet};
     use n0_tracing_test::traced_test;
     use url::Url;
 
@@ -409,6 +432,145 @@ mod tests {
         })
         .await
         .expect("timeout, relay_url not found on DHT");
+        Ok(())
+    }
+
+    /// Dropping the address lookup stops its publishing, and with it the DHT
+    /// node it built, which frees the node's socket.
+    #[tokio::test]
+    async fn dropping_the_lookup_stops_publishing_and_frees_the_socket() -> Result {
+        let testnet = Testnet::new(3).await.anyerr()?;
+        let port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .anyerr()?
+            .local_addr()
+            .anyerr()?
+            .port();
+        let mut dht_builder = DhtBuilder::default();
+        dht_builder.bootstrap(&testnet.bootstrap).port(port);
+        let address_lookup = DhtAddressLookup::builder()
+            .secret_key(SecretKey::generate())
+            .dht_builder(dht_builder)
+            .addr_filter(AddrFilter::unfiltered())
+            .build()?;
+        let relay_url: RelayUrl = Url::parse("https://example.com").anyerr()?.into();
+        address_lookup.publish(&EndpointData::from_iter([TransportAddr::Relay(relay_url)]));
+        // Let the publish task start.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        drop(address_lookup);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::net::UdpSocket::bind(("0.0.0.0", port)).is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the DHT node kept its socket after the lookup was dropped");
+        Ok(())
+    }
+
+    /// A given DHT node publishes and resolves addresses, and serves peer
+    /// announcements on the same socket meanwhile.
+    #[tokio::test]
+    async fn a_given_dht_serves_addresses_and_peers() -> Result {
+        let testnet = Testnet::new(3).await.anyerr()?;
+        let node = || {
+            let mut builder = DhtBuilder::default();
+            builder.bootstrap(&testnet.bootstrap);
+            builder.build().anyerr()
+        };
+        let shared = node()?;
+        let secret = SecretKey::generate();
+        let publisher = DhtAddressLookup::builder()
+            .secret_key(secret.clone())
+            .dht(shared.clone())
+            .addr_filter(AddrFilter::unfiltered())
+            .build()?;
+        let relay_url: RelayUrl = Url::parse("https://example.com").anyerr()?.into();
+        publisher.publish(&EndpointData::from_iter([TransportAddr::Relay(
+            relay_url.clone(),
+        )]));
+        let info_hash = Id::random();
+        shared.announce_peer(info_hash, None).await.anyerr()?;
+        let port = shared.info().await.anyerr()?.local_addr().port();
+
+        let reader = node()?;
+        let peers = reader.get_peers(info_hash).await.anyerr()?.next().await;
+        assert!(
+            peers.is_some_and(|peers| peers.iter().any(|peer| peer.port() == port)),
+            "the announcement did not come from the given node's socket"
+        );
+        let resolver = DhtAddressLookup::builder()
+            .dht(reader)
+            .no_publish()
+            .build()?;
+        // Resolves dropped before they answer leave the lookups working.
+        for lookup in [&publisher, &resolver] {
+            for _ in 0..8 {
+                let mut items = lookup.resolve(SecretKey::generate().public()).unwrap();
+                assert!(poll_once(items.next()).await.is_none());
+            }
+        }
+        for lookup in [&resolver, &publisher] {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let items = lookup
+                        .resolve(secret.public())
+                        .unwrap()
+                        .collect::<Vec<_>>()
+                        .await;
+                    if items
+                        .iter()
+                        .flatten()
+                        .any(|item| item.relay_urls().any(|url| *url == relay_url))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await
+            .expect("the address published through the given node was not found");
+        }
+        Ok(())
+    }
+
+    /// A given DHT node keeps running when the address lookup is dropped, and
+    /// stops when its owner drops it too.
+    #[tokio::test]
+    async fn a_given_dht_runs_until_its_owner_drops_it() -> Result {
+        let testnet = Testnet::new(3).await.anyerr()?;
+        let port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .anyerr()?
+            .local_addr()
+            .anyerr()?
+            .port();
+        let mut builder = DhtBuilder::default();
+        builder.bootstrap(&testnet.bootstrap).port(port);
+        let dht = builder.build().anyerr()?;
+        let address_lookup = DhtAddressLookup::builder()
+            .secret_key(SecretKey::generate())
+            .dht(dht.clone())
+            .addr_filter(AddrFilter::unfiltered())
+            .build()?;
+        let relay_url: RelayUrl = Url::parse("https://example.com").anyerr()?.into();
+        address_lookup.publish(&EndpointData::from_iter([TransportAddr::Relay(relay_url)]));
+        // Let the publish task start.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        drop(address_lookup);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            dht.info().await.is_ok(),
+            "the given node stopped with the lookup"
+        );
+        drop(dht);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::net::UdpSocket::bind(("0.0.0.0", port)).is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the node kept its socket after its owner dropped it");
         Ok(())
     }
 }
