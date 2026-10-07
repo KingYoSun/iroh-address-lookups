@@ -411,4 +411,37 @@ mod tests {
         .expect("timeout, relay_url not found on DHT");
         Ok(())
     }
+
+    /// Dropping the address lookup stops its publishing, and with it the DHT
+    /// node it built, which frees the node's socket.
+    #[tokio::test]
+    async fn dropping_the_lookup_stops_publishing_and_frees_the_socket() -> Result {
+        let testnet = Testnet::new(3).await.anyerr()?;
+        let port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .anyerr()?
+            .local_addr()
+            .anyerr()?
+            .port();
+        let mut dht_builder = DhtBuilder::default();
+        dht_builder.bootstrap(&testnet.bootstrap).port(port);
+        let address_lookup = DhtAddressLookup::builder()
+            .secret_key(SecretKey::generate())
+            .dht_builder(dht_builder)
+            .addr_filter(AddrFilter::unfiltered())
+            .build()?;
+        let relay_url: RelayUrl = Url::parse("https://example.com").anyerr()?.into();
+        address_lookup.publish(&EndpointData::from_iter([TransportAddr::Relay(relay_url)]));
+        // Let the publish task start.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        drop(address_lookup);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::net::UdpSocket::bind(("0.0.0.0", port)).is_err() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the DHT node kept its socket after the lookup was dropped");
+        Ok(())
+    }
 }
